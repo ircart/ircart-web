@@ -1,0 +1,7 @@
+.env
+data/
+art/
+venv/
+__pycache__/
+*.log
+.git/
