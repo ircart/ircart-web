@@ -19,7 +19,7 @@ CODES   = re.compile(r'\x03(\d{1,2})?(?:,(\d{1,2}))?|([\x02\x0f\x11\x16\x1d\x1e\
 PALETTE = 'ffffff 000000 00007f 009300 ff0000 7f0000 9c009c fc7f00 ffff00 00fc00 009393 00ffff 0000fc ff00ff 7f7f7f d2d2d2 470000 472100 474700 324700 004700 00472c 004747 002747 000047 2e0047 470047 47002a 740000 743a00 747400 517400 007400 007449 007474 004074 000074 4b0074 740074 740045 b50000 b56300 b5b500 7db500 00b500 00b571 00b5b5 0063b5 0000b5 7500b5 b500b5 b5006b ff0000 ff8c00 ffff00 b2ff00 00ff00 00ffa0 00ffff 008cff 0000ff a500ff ff00ff ff0098 ff5959 ffb459 ffff71 cfff60 6fff6f 65ffc9 6dffff 59b4ff 5959ff c459ff ff66ff ff59bc ff9c9c ffd39c ffff9c e2ff9c 9cff9c 9cffdb 9cffff 9cd3ff 9c9cff dc9cff ff9cff ff94d3 000000 131313 282828 363636 4d4d4d 656565 818181 9f9f9f bcbcbc e2e2e2 ffffff'.split()
 RGB     = [(int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)) for c in PALETTE]
 THUMB   = (40, 120) # Max lines & columns shown in a thumbnail
-CACHE_V = 3 # Bump when the cached index format changes
+CACHE_V = 4 # Bump when the cached index format changes
 
 
 def ansi256(index: int) -> int:
@@ -95,7 +95,7 @@ def export(text: str, fmt: str) -> str:
 		else:
 			out.append(''.join(ansi_run(key, txt, fmt) for key, txt in runs) + '\x1b[0m')
 	if fmt == 'html':
-		return '<pre style="background:#000;color:#d2d2d2;font-family:\'DejaVu Sans Mono\',monospace;line-height:1;margin:0;padding:8px">' + '\n'.join(out) + '</pre>\n'
+		return '<pre style="background:#000;color:#d2d2d2;font-family:\'DejaVu Sans Mono\',monospace;line-height:normal;margin:0;padding:8px">' + '\n'.join(out) + '</pre>\n'
 	return '\n'.join(out) + '\n'
 
 
@@ -107,7 +107,13 @@ def grid_of(lines: list) -> list:
 
 	grid = []
 	for line in lines:
-		cells = [(c, None if c == ' ' else f, b) for c, f, b, _ in parse(line)]
+		cells = []
+		for c, f, b, _ in parse(line):
+			if c == '\u2588': # a full block is just a background in its foreground color
+				c, b = ' ', f
+			elif f is not None and f == b: # text in its own background color is invisible
+				c = ' '
+			cells.append((c, None if c == ' ' else f, b))
 		while cells and cells[-1][0] == ' ' and cells[-1][2] in (None, 1, 99):
 			cells.pop()
 		grid.append(tuple(cells))
@@ -167,14 +173,17 @@ def near_pairs(root: str, index: dict, threshold: float = 0.95, progress=None) -
 		if entry['height'] >= 3:
 			groups.setdefault(entry['height'], []).append(name)
 	groups = [g for g in groups.values() if len(g) > 1]
-	blank  = lambda c: c is None or (c[0] == ' ' and c[2] in (None, 1, 99))
 	total  = sum(len(g) * (len(g) - 1) // 2 for g in groups) or 1
 	pairs, done = [], 0
 	for names in groups:
 		grids = {}
 		for n in names:
-			with open(os.path.join(root, n + '.txt'), 'rb') as fd:
-				grids[n] = grid_of(decode(fd.read()).replace('\r', '').rstrip('\n').split('\n'))
+			try:
+				with open(os.path.join(root, n + '.txt'), 'rb') as fd:
+					grids[n] = grid_of(decode(fd.read()).replace('\r', '').rstrip('\n').split('\n'))
+			except FileNotFoundError: # deleted or moved since the index snapshot
+				continue
+		names  = list(grids)
 		widths = {n: max(map(len, grids[n]), default=0) for n in names}
 		for a, b in itertools.combinations(names, 2):
 			done += 1
@@ -182,20 +191,58 @@ def near_pairs(root: str, index: dict, threshold: float = 0.95, progress=None) -
 				progress(done * 100 // total)
 			if abs(widths[a] - widths[b]) > 2:
 				continue
-			tot = same = 0
-			for la, lb in zip(grids[a], grids[b]):
-				for i in range(max(len(la), len(lb))):
-					ca = la[i] if i < len(la) else None
-					cb = lb[i] if i < len(lb) else None
-					if blank(ca) and blank(cb):
-						continue
-					tot  += 1
-					same += ca == cb
-				if tot > 200 and same / tot < 0.6:
-					break
-			if tot and same / tot >= threshold:
-				pairs.append({'a': a, 'b': b, 'sim': round(same / tot * 100, 2)})
+			if (sim := similarity(grids[a], grids[b])) >= threshold:
+				pairs.append({'a': a, 'b': b, 'sim': round(sim * 100, 2)})
 	return sorted(pairs, key=lambda p: -p['sim'])
+
+
+def similarity(ga: list, gb: list) -> float:
+	'''Fraction of non blank cells that match between two grids of the same height (0 when clearly different).
+
+	:param ga: first grid
+	:param gb: second grid
+	'''
+
+	blank = lambda c: c is None or (c[0] == ' ' and c[2] in (None, 1, 99))
+	tot = same = 0
+	for la, lb in zip(ga, gb):
+		for i in range(max(len(la), len(lb))):
+			ca = la[i] if i < len(la) else None
+			cb = lb[i] if i < len(lb) else None
+			if blank(ca) and blank(cb):
+				continue
+			tot  += 1
+			same += ca == cb
+		if tot > 200 and same / tot < 0.6:
+			return 0
+	return same / tot if tot else 0
+
+
+def matches(root: str, index: dict, text: str, threshold: float = 0.95) -> list:
+	'''Existing art that new art matches at least the threshold, best first.
+
+	:param root: art directory
+	:param index: mapping of art name to index entry
+	:param text: decoded art with LF line endings
+	:param threshold: minimum similarity (0-1)
+	'''
+
+	grid  = grid_of(text.rstrip('\n').split('\n'))
+	width = max(map(len, grid), default=0)
+	found = []
+	if len(grid) < 3:
+		return found
+	for name, entry in index.items():
+		if entry['height'] != len(grid) or abs(entry['cols'] - width) > 2:
+			continue
+		try:
+			with open(os.path.join(root, name + '.txt'), 'rb') as fd:
+				other = grid_of(decode(fd.read()).replace('\r', '').rstrip('\n').split('\n'))
+		except FileNotFoundError:
+			continue
+		if (sim := similarity(grid, other)) >= threshold:
+			found.append({'name': name, 'cols': entry['cols'], 'sim': round(sim * 100, 2)})
+	return sorted(found, key=lambda m: -m['sim'])[:5]
 
 
 def parse(line: str) -> list:

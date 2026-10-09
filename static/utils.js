@@ -136,8 +136,8 @@ const routes = [
 	[/^\/art\/(.+)$/,         (m) => artPage(decodeURIComponent(m[1]))],
 	[/^\/dirs$/,              () => go('/')],
 	[/^\/dir\/(.*)$/,         (m) => galleryPage('main', {dir: decodeURIComponent(m[1])})],
-	[/^\/authors$/,           () => authorsPage()],
-	[/^\/author\/(.+)$/,      (m) => authorPage(decodeURIComponent(m[1]))],
+	[/^\/artists$/,           () => authorsPage()],
+	[/^\/artist\/(.+)$/,      (m) => authorPage(decodeURIComponent(m[1]))],
 	[/^\/user\/(.+)$/,        (m) => userPage(decodeURIComponent(m[1]))],
 	[/^\/recent$/,            () => recentPage()],
 	[/^\/about$/,             () => aboutPage()],
@@ -160,6 +160,7 @@ async function route() {
 	const path = location.pathname;
 	$$('nav a').forEach((a) => a.classList.toggle('active', a.getAttribute('href') === path || (path.startsWith('/admin') && path !== '/admin/reports' && a.getAttribute('href') === '/admin')));
 	window.scrollTo(0, 0);
+	refreshBadges();
 	for (const [re, fn] of routes) {
 		const m = path.match(re);
 		if (m) { try { await fn(m); } catch (ex) { page(`<h1>Error</h1><p class="error">${esc(ex.message)}</p>`); } return; }
@@ -189,7 +190,15 @@ async function loadMe() {
 		$('#logout').onclick = async () => { await api('/api/logout', {}); await loadMe(); route(); };
 	} else box.innerHTML = '<a href="/login" class="btn"><svg class="ic"><use href="#i-login"/></svg>Login</a><a href="/register" class="btn primary"><svg class="ic"><use href="#i-userplus"/></svg>Register</a>';
 	$$('.admin-only').forEach((el) => el.hidden = !(me && me.admin));
-	if (me && me.admin) api('/api/admin/status').then((s) => { $('#report-count').textContent = s.open_reports || ''; $('#report-count').hidden = !s.open_reports; }).catch(() => {});
+	refreshBadges();
+}
+
+function refreshBadges() {
+	if (!me || !me.admin) { $('#upload-count').hidden = true; return; }
+	api('/api/admin/status').then((s) => {
+		$('#report-count').textContent = s.open_reports || ''; $('#report-count').hidden = !s.open_reports;
+		$('#upload-count').textContent = s.queued_uploads || ''; $('#upload-count').hidden = !s.queued_uploads;
+	}).catch(() => {});
 }
 
 function authPage(mode) {
@@ -226,12 +235,13 @@ async function getFiles(scope) {
 
 function card(f) {
 	const author = f.author ? ` · by ${esc(f.author)}` : '';
-	return `<a class="card" href="${artLink(f.name)}"><div class="thumb"><pre class="art" style="font-size:${thumbSize(Math.min(f.cols, 120))}" data-thumb="${esc(f.name)}"></pre></div><div class="label"><b title="${esc(f.name)}">${esc(f.name)}</b><span>${f.lines} lines · ${f.cols} cols${author}</span> ${starText(f.avg, f.votes)}</div></a>`;
+	const flag = me && me.admin ? `<span class="flag" role="button" title="report as broken / renders wrong" data-flag="${esc(f.name)}"><svg class="ic"><use href="#i-flag"/></svg></span>` : '';
+	return `<a class="card" href="${artLink(f.name)}">${flag}<div class="thumb"><pre class="art" style="font-size:${thumbSize(Math.min(f.cols, 120))}" data-thumb="${esc(f.name)}"></pre></div><div class="label"><b title="${esc(f.name)}">${esc(f.name)}</b><span>${f.lines} lines · ${f.cols} cols${author}</span> ${starText(f.avg, f.votes)}</div></a>`;
 }
 
 async function fillThumbs(root, list) {
 	if (!list.length) return;
-	const thumbs = await api('/api/thumbs?' + new URLSearchParams(list.map((f) => ['n', f.name])));
+	const thumbs = await api('/api/thumbs', {names: list.map((f) => f.name)});
 	list.forEach((f) => { const el = root.querySelector(`[data-thumb="${CSS.escape(f.name)}"]`); if (el) { el.style.fontSize = thumbSize(Math.min(f.cols, 120), el.parentElement.clientWidth || 236); el.innerHTML = thumbs[f.name] || ''; } });
 }
 
@@ -239,6 +249,14 @@ function infiniteGrid(container, list, emptyText = 'nothing here') {
 	let shown = 0, busy = false;
 	container.innerHTML = '<div class="grid"></div><div class="sentinel"></div>';
 	const grid = $('.grid', container), sentinel = $('.sentinel', container);
+	grid.addEventListener('click', async (e) => {
+		const flag = e.target.closest('.flag');
+		if (!flag) return;
+		e.preventDefault();
+		e.stopPropagation();
+		if (flag.classList.contains('done')) return;
+		try { await api('/api/report', {art: flag.dataset.flag, reason: 'broken'}); flag.classList.add('done'); toast(`reported ${flag.dataset.flag} as broken`); } catch (ex) { toast(ex.message, true); }
+	});
 	sentinel.id = 'sentinel';
 	async function more() {
 		if (busy) return;
@@ -265,22 +283,43 @@ async function galleryPage(scope, preset = {}) {
 	const title = scope === 'uploads' ? 'Uploads' : preset.dir !== undefined ? `/${esc(preset.dir || '(root)')}` : 'Gallery';
 	if (scope === 'uploads') setMeta('Uploads', 'IRC art uploaded by the IRCart community.'); else if (preset.dir !== undefined) setMeta(`/${preset.dir || '(root)'} - IRC art directory`, `${files.filter((f) => f.dir === preset.dir).length} IRC art pieces in /${preset.dir || '(root)'}.`);
 	const p = page(`<h1>${title}</h1><div class="controls">
-		<input type="search" id="q" placeholder="search names${scope === 'uploads' ? ' or accounts' : ' or authors'}">
+		<input type="search" id="q" maxlength="100" placeholder="search names${scope === 'uploads' ? ' or accounts' : ' or artists'}">
 		${scope === 'main' && preset.dir === undefined ? `<select id="dir"><option value="*">all dirs</option>${dirs.map((d) => `<option value="${esc(d)}">${d ? esc(d) : '(root)'}</option>`).join('')}</select>` : ''}
-		<select id="sort"><option value="name">name</option><option value="mtime">newest</option><option value="top">top rated</option><option value="lines">most lines</option><option value="cols">widest</option><option value="size">largest</option></select>
+		<select id="sort">${scope === 'main' && preset.dir === undefined ? '<option value="random">random</option>' : ''}<option value="name">name</option><option value="mtime">date</option><option value="top">rating</option><option value="lines">lines</option><option value="cols">width</option><option value="size">size</option></select><button class="btn" id="order" type="button"></button>
 		<span id="count" class="dim"></span></div><div id="results"></div>`);
+	const params = new URLSearchParams(location.search);
+	$('#q').value = (params.get('q') || '').slice(0, 100);
+	const pick = (sel, value) => { if (sel && [...sel.options].some((o) => o.value === value)) sel.value = value; };
+	pick($('#dir'), params.get('dir'));
+	if ($('#dir') && $('#dir').value !== '*') $('#sort').value = 'name';
+	pick($('#sort'), params.get('sort'));
+	let rev = params.get('order') === 'rev';
+	const syncUrl = () => {
+		const url = new URL(location.href), defSort = $('#sort').options[0].value;
+		for (const [key, value, def] of [['q', $('#q').value.slice(0, 100), ''], ['dir', $('#dir') ? $('#dir').value : '*', '*'], ['sort', $('#sort').value, $('#dir') && $('#dir').value !== '*' ? 'name' : defSort], ['order', rev ? 'rev' : '', '']]) {
+			if (value !== def) url.searchParams.set(key, value); else url.searchParams.delete(key);
+		}
+		history.replaceState(null, '', url.pathname + url.search);
+	};
+	const rnd = new Map(files.map((f) => [f.name, Math.random()]));
 	const apply = () => {
 		const q = $('#q').value.toLowerCase(), dir = preset.dir !== undefined ? preset.dir : ($('#dir') ? $('#dir').value : '*'), sort = $('#sort').value;
 		const list = files.filter((f) => (dir === '*' || f.dir === dir) && (f.name.toLowerCase().includes(q) || (f.author || '').toLowerCase().includes(q)));
 		const num = {mtime: 1, lines: 1, cols: 1, size: 1}[sort];
-		list.sort((a, b) => sort === 'top' ? (b.avg - a.avg) || (b.votes - a.votes) : num ? b[sort] - a[sort] : a.name.localeCompare(b.name));
+		list.sort((a, b) => sort === 'random' ? rnd.get(a.name) - rnd.get(b.name) : sort === 'top' ? (b.avg - a.avg) || (b.votes - a.votes) : num ? b[sort] - a[sort] : a.name.localeCompare(b.name));
+		if (rev && sort !== 'random') list.reverse();
+		const asc = (sort === 'name') !== rev; // name sorts A-Z by default, everything else biggest/newest first
+		$('#order').hidden = sort === 'random';
+		$('#order').textContent = asc ? '↑ asc' : '↓ desc';
+		$('#order').title = asc ? 'ascending, click for descending' : 'descending, click for ascending';
 		$('#count').textContent = `${list.length.toLocaleString()} files`;
 		if (observer) observer.disconnect();
 		infiniteGrid($('#results', p), list);
 	};
-	$('#q').oninput = apply;
-	$('#sort').onchange = apply;
-	if ($('#dir')) $('#dir').onchange = apply;
+	$('#q').oninput = () => { syncUrl(); apply(); };
+	$('#sort').onchange = () => { rev = false; syncUrl(); apply(); };
+	$('#order').onclick = () => { rev = !rev; syncUrl(); apply(); };
+	if ($('#dir')) $('#dir').onchange = () => { $('#sort').value = $('#dir').value === '*' ? 'random' : 'name'; rev = false; syncUrl(); apply(); };
 	apply();
 }
 
@@ -323,10 +362,10 @@ async function artPage(name) {
 	const data = await api(artApi(name));
 	const m = data.meta, isUpload = name.startsWith('uploads/');
 	setMeta(`${name.split('/').pop()} - IRC art${data.author ? ' by ' + data.author : ''}`, `"${name}" IRC ASCII art: ${m.lines} lines, ${m.cols} columns. View, rate & copy it as IRC, ANSI or HTML.`);
-	const authorHtml = data.author ? (data.author_user ? `<a href="/user/${encodeURIComponent(data.author_user)}">${esc(data.author)}</a>` : `<a href="/author/${encodeURIComponent(data.author)}">${esc(data.author)}</a>`) : '<span class="dim">unknown</span>';
+	const authorHtml = data.author ? (data.author_user ? `<a href="/user/${encodeURIComponent(data.author_user)}">${esc(data.author)}</a>` : `<a href="/artist/${encodeURIComponent(data.author)}">${esc(data.author)}</a>`) : '<span class="dim">unknown</span>';
 	const where = isUpload ? `uploaded by <a href="/user/${encodeURIComponent(data.uploader)}">${esc(data.uploader)}</a>` : `in <a href="/dir/${encodeURIComponent(m.dir)}">/${esc(m.dir || '(root)')}</a>`;
 	const p = page(`<div class="art-head"><h1>${esc(name)}</h1>
-		<span class="dim">${where} · author ${authorHtml} · ${m.lines} lines · ${m.cols} cols · ${m.size.toLocaleString()} bytes</span></div>
+		<span class="dim">${where} · artist ${authorHtml} · ${m.lines} lines · ${m.cols} cols · ${m.size.toLocaleString()} bytes</span></div>
 		<div class="toolbar">${starsWidget(data.mine || Math.round(data.avg), !me)}<span class="dim">${data.votes ? `${data.avg.toFixed(2)} from ${data.votes} rating${data.votes > 1 ? 's' : ''}` : 'no ratings yet'}${me ? (data.mine ? ` · you rated ${data.mine}` : '') : ' · login to rate'}</span></div>
 		<div class="toolbar">
 			<button class="btn primary" id="copy"><svg class="ic"><use href="#i-copy"/></svg>Copy</button><select id="fmt" aria-label="copy format"><option value="irc">IRC</option><option value="ansi24">ANSI (truecolor)</option><option value="ansi256">ANSI (256)</option><option value="html">HTML</option></select>
@@ -350,19 +389,20 @@ async function artPage(name) {
 	$$('.stars span', p).forEach((s) => s.onclick = async () => {
 		try { await api('/api/rate', {art: name, stars: Number(s.dataset.star)}); toast('rating saved'); filesCache = {}; artPage(name); } catch (ex) { toast(ex.message, true); }
 	});
-	const ccap = captchaBox($('#c-captcha', p));
+	const ccap = me.admin ? null : captchaBox($('#c-captcha', p));
 	let rcap = null;
 	$('#report-btn').onclick = () => {
 		$('#report').hidden = !$('#report').hidden;
-		if (!$('#report').hidden && !rcap) rcap = captchaBox($('#r-captcha', p));
+		if (!$('#report').hidden && !rcap && !me.admin) rcap = captchaBox($('#r-captcha', p));
 	};
 	$('#r-cancel').onclick = () => { $('#report').hidden = true; };
+	if (new URLSearchParams(location.search).get('report') === 'wrong_author') { $('#report-btn').click(); $('#r-reason').value = 'wrong_author'; $('#r-note').placeholder = 'who made it?'; $('#r-note').focus(); }
 	$('#r-go').onclick = async () => {
-		try { await api('/api/report', {art: name, reason: $('#r-reason').value, note: $('#r-note').value, ...(await rcap.values())}); toast('report sent to the admin, thanks'); $('#r-note').value = ''; $('#report').hidden = true; } catch (ex) { toast(ex.message, true); }
-		rcap.reload();
+		try { await api('/api/report', {art: name, reason: $('#r-reason').value, note: $('#r-note').value, ...(rcap ? await rcap.values() : {})}); toast('report sent to the admin, thanks'); $('#r-note').value = ''; $('#report').hidden = true; } catch (ex) { toast(ex.message, true); }
+		if (rcap) rcap.reload();
 	};
 	$('#c-go').onclick = async () => {
-		try { await api('/api/comment', {art: name, body: $('#c-body').value, ...(await ccap.values())}); artPage(name); } catch (ex) { toast(ex.message, true); ccap.reload(); }
+		try { await api('/api/comment', {art: name, body: $('#c-body').value, ...(ccap ? await ccap.values() : {})}); artPage(name); } catch (ex) { toast(ex.message, true); if (ccap) ccap.reload(); }
 	};
 	if (isUpload && (data.uploader === me.name || me.admin)) {
 		$('#owner').innerHTML = `<div class="panel"><h3>${data.uploader === me.name ? 'Your upload' : 'Upload'}</h3><button class="danger" id="u-del">Delete this upload</button></div>`;
@@ -371,7 +411,7 @@ async function artPage(name) {
 	if (me.admin) {
 		const [dirs, authors] = await Promise.all([mainDirs(), api('/api/authors')]);
 		$('#admin').innerHTML = `<div class="panel"><h3>Admin</h3>
-			<div class="row"><span>Author</span><input id="a-author" list="a-list" value="${esc(data.author)}" placeholder="author name"><datalist id="a-list">${authors.map((a) => `<option value="${esc(a.author)}">`).join('')}</datalist><button id="a-save">Save author</button></div>
+			<div class="row"><span>Artist</span><input id="a-author" list="a-list" value="${esc(data.author)}" placeholder="artist name"><datalist id="a-list">${authors.map((a) => `<option value="${esc(a.author)}">`).join('')}</datalist><button id="a-save">Save artist</button></div>
 			<div class="row" id="a-move"><span>${isUpload ? 'Promote to' : 'Move to'}</span>${moveControls(isUpload ? name.slice(name.lastIndexOf('/') + 1) : name, dirs)}<button id="a-mv">${isUpload ? 'Promote' : 'Move/rename'}</button><button class="danger" id="a-del">Delete</button></div></div>`;
 		$('#a-save').onclick = async () => { try { await api('/api/author', {art: name, author: $('#a-author').value}); filesCache = {}; artPage(name); } catch (ex) { toast(ex.message, true); } };
 		$('#a-mv').onclick = async () => { const dest = readMove($('#a-move')); if (await doMove(name, dest)) go(artLink(dest)); };
@@ -383,8 +423,29 @@ async function artPage(name) {
 
 async function authorsPage() {
 	const authors = await api('/api/authors');
-	setMeta('Authors');
-	page(`<h1>Authors</h1>${authors.length ? `<div class="list">${authors.map((a) => `<a href="/author/${encodeURIComponent(a.author)}">${esc(a.author)} <span>${a.count}</span></a>`).join('')}</div>` : '<p class="dim">No art has been credited yet.</p>'}`);
+	setMeta('Artists', 'IRC art artists credited on IRCart.');
+	const p = page(`<h1>Artists</h1>${authors.length ? `<div class="controls"><input type="search" id="q" maxlength="100" placeholder="search artists"><span id="count" class="dim"></span></div><div class="artists">${authors.map((a, i) => `<div class="artist" data-i="${i}"><a class="name" href="/artist/${encodeURIComponent(a.author)}">${esc(a.author)} <span>${a.count} piece${a.count === 1 ? '' : 's'}</span></a><div class="minis">${a.samples.map((f) => `<a class="mini" href="${artLink(f.name)}" title="${esc(f.name)}"><pre class="art" data-thumb="${esc(f.name)}"></pre></a>`).join('')}</div></div>`).join('')}</div>` : '<p class="dim">No art has been credited yet.</p>'}`);
+	observer = new IntersectionObserver((entries) => entries.forEach((e) => {
+		if (!e.isIntersecting) return;
+		observer.unobserve(e.target);
+		fillThumbs(e.target, authors[e.target.dataset.i].samples);
+	}), {rootMargin: '600px'});
+	$$('.artist', p).forEach((el) => observer.observe(el));
+	if (!authors.length) return;
+	const apply = () => {
+		const q = $('#q').value.toLowerCase();
+		let shown = 0;
+		$$('.artist', p).forEach((el) => { el.hidden = !authors[el.dataset.i].author.toLowerCase().includes(q); shown += !el.hidden; });
+		$('#count').textContent = `${shown} artist${shown === 1 ? '' : 's'}`;
+	};
+	$('#q').value = (new URLSearchParams(location.search).get('q') || '').slice(0, 100);
+	$('#q').oninput = () => {
+		const url = new URL(location.href);
+		if ($('#q').value) url.searchParams.set('q', $('#q').value.slice(0, 100)); else url.searchParams.delete('q');
+		history.replaceState(null, '', url.pathname + url.search);
+		apply();
+	};
+	apply();
 }
 
 async function authorPage(name) {
@@ -433,7 +494,7 @@ function aboutPage() {
 		<h2>Contribute</h2>
 		<p><a href="/register">Create an account</a> (just a username and password) and <a href="/upload">upload your art</a>: it shows up under <a href="/uploads">Uploads</a> and on your profile. You can also send art to the git repository directly. Spot something broken, misnamed, in the wrong directory or credited to the wrong person? Use the report box on its page.</p>
 		<h2>Credits</h2>
-		<p>The collection spans decades of IRC and BBS art from countless artists and groups, including pp4l, blocktronics and many others. Where we know who made a piece it carries an author tag; if you know the author of something untagged, report it with the name.</p>
+		<p>The collection spans decades of IRC and BBS art from countless artists and groups, including pp4l, blocktronics, ACiD, 16colo.rs and many others. Where we know who made a piece it carries an artist tag; if you know the artist of something untagged, report it with the name.</p>
 		<p>IRCart is made by <a href="/user/acidvegas">acidvegas</a> for <a href="https://supernets.org" target="_blank" rel="noopener">SuperNETs</a>.</p></div>`);
 }
 
@@ -445,17 +506,36 @@ function uploadPage() {
 		<label>Name</label><input id="u-name" maxlength="40" placeholder="letters, digits, _ or -">
 		<label>File</label><input type="file" id="u-file" accept=".txt,text/plain">
 		<label>...or paste it</label><textarea id="u-text" rows="8" placeholder="paste IRC art here"></textarea>
-		<div id="u-captcha"></div><button class="primary" id="u-go">Upload</button></div>`);
+		<div id="u-captcha"></div><button class="primary" id="u-go">Upload</button><div id="u-match" class="panel" hidden></div></div>`);
 	const cap = captchaBox($('#u-captcha', p));
-	$('#u-go').onclick = async () => {
+	const send = async (force) => {
 		const fd = new FormData(), file = $('#u-file').files[0];
 		fd.append('name', $('#u-name').value.trim());
 		if (file) fd.append('file', file); else fd.append('text', $('#u-text').value);
 		Object.entries(await cap.values()).forEach(([k, v]) => fd.append(k, v));
+		if (force) fd.append('force', '1');
 		$('#u-go').disabled = true;
-		try { const r = await api('/api/upload', fd); filesCache = {}; go(artLink(r.art)); } catch (ex) { toast(ex.message, true); cap.reload(); }
+		$('#u-match').hidden = true;
+		try { const r = await api('/api/upload', fd); filesCache = {}; go(artLink(r.art)); } catch (ex) {
+			if (ex.data && ex.data.matches) showMatches(ex.data.matches); else { toast(ex.message, true); cap.reload(); }
+		}
 		$('#u-go').disabled = false;
 	};
+	const showMatches = (found) => {
+		const box = $('#u-match');
+		box.innerHTML = `<h3>Is this the same art?</h3><p>It is at least 95% the same as ${found.length === 1 ? 'a piece' : 'these pieces'} already on IRCart:</p>
+			<div class="minis">${found.map((f) => `<a class="mini" href="${artLink(f.name)}" target="_blank" title="${esc(f.name)} (${f.sim}% match)"><pre class="art" data-thumb="${esc(f.name)}"></pre></a>`).join('')}</div>
+			<p class="dim">${found.map((f) => `<a href="${artLink(f.name)}" target="_blank">${esc(f.name)}</a> ${f.sim}%`).join(' · ')}</p>
+			<div class="row"><button class="btn primary" id="m-same">Yes, it's the same</button><button class="btn" id="m-new">No, upload it anyway</button></div>`;
+		box.hidden = false;
+		fillThumbs(box, found);
+		$('#m-new').onclick = () => send(true);
+		$('#m-same').onclick = () => {
+			box.innerHTML = `<h3>No need to upload it then</h3><p>If that piece is missing its artist or credits the wrong one, open it and send a report with the correct artist:</p>
+				<p>${found.map((f) => `<a class="btn" href="${artLink(f.name)}?report=wrong_author"><svg class="ic"><use href="#i-flag"/></svg>Report artist for ${esc(f.name)}</a>`).join(' ')}</p>`;
+		};
+	};
+	$('#u-go').onclick = () => send(false);
 }
 
 // ---- admin ----

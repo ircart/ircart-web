@@ -7,9 +7,9 @@ IRCart is the central hub for IRC formatted ASCII & ANSI art. It serves the [irc
 - Accurate previews rendered from the mIRC color codes *(all 99 colors, bold, italic, underline, reverse)*
 - Copy any piece as IRC *(original file)*, ANSI truecolor, ANSI 256 or a self-contained HTML snippet
 - Accounts with just a username & password
-- Comments, 1-5 star ratings & reports for broken art, wrong directories, wrong names or wrong authors
+- Comments, 1-5 star ratings & reports for broken art, wrong directories, wrong names or wrong artists
 - Uploads saved into the repository under `uploads/<account>/<name>.txt` *(10,000 lines & 3 MB max)*
-- Author tags with author pages that link to a matching account
+- Artist tags with artist pages that link to a matching account
 - Profiles with a profile picture, uploads, credited art & comments
 - Self-hosted image captcha plus a browser proof-of-work on register, login, comments, reports & uploads
 - Admin tools: reports, same-name files, near duplicates *(95% or more alike)*, move/rename/delete with name clash protection & a git pull button

@@ -63,7 +63,7 @@ AVATAR_BYTES = 512 * 1024
 AVATAR_PX    = 512
 NAME_RE      = re.compile(r'^[A-Za-z0-9_-]{3,20}$')
 ART_RE       = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
-REASONS      = {'broken': 'Broken / renders wrong', 'wrong_dir': 'Wrong directory', 'wrong_name': 'Wrong name', 'wrong_author': 'Wrong author'}
+REASONS      = {'broken': 'Broken / renders wrong', 'wrong_dir': 'Wrong directory', 'wrong_name': 'Wrong name', 'wrong_author': 'Wrong artist'}
 
 os.makedirs(os.path.join(DATA, 'avatars'), exist_ok=True)
 
@@ -263,7 +263,11 @@ def near_scan():
 	while not state['ready']:
 		time.sleep(1)
 	state['near_status'], state['near_progress'] = 'scanning', 0
-	state['near'] = art.near_pairs(ART, dict(state['index']), 0.95, lambda p: state.update(near_progress=p))
+	try:
+		state['near'] = art.near_pairs(ART, dict(state['index']), 0.95, lambda p: state.update(near_progress=p))
+	except Exception:
+		state['near_status'] = 'failed'
+		raise
 	state['near_status'], state['near_progress'] = 'done', 100
 	print(f'near scan found {len(state["near"]):,} pairs', flush=True)
 
@@ -291,6 +295,15 @@ def csrf_check():
 		session['csrf'] = secrets.token_hex(16)
 	if request.method == 'POST' and request.headers.get('X-CSRF') != session['csrf']:
 		return jsonify({'error': 'bad csrf token, reload the page'}), 400
+
+
+@app.after_request
+def no_api_cache(response: Response) -> Response:
+	'''Stop browsers reusing stale API data, like a file list from before a rename.'''
+
+	if request.path.startswith('/api/'):
+		response.headers['Cache-Control'] = 'no-store'
+	return response
 
 
 @app.teardown_appcontext
@@ -432,7 +445,7 @@ def api_admin_status():
 	'''Git sync & index status for the admin page.'''
 
 	dirty = git('status', '--porcelain').stdout.strip().splitlines()
-	return jsonify({'git': state['git'], 'pulling': state['pulling'], 'dirty': dirty[:50], 'dirty_count': len(dirty), 'files': len(state['index']), 'open_reports': con().execute("SELECT COUNT(*) FROM reports WHERE status = 'open'").fetchone()[0]})
+	return jsonify({'git': state['git'], 'pulling': state['pulling'], 'dirty': dirty[:50], 'dirty_count': len(dirty), 'files': len(state['index']), 'open_reports': con().execute("SELECT COUNT(*) FROM reports WHERE status = 'open'").fetchone()[0], 'queued_uploads': sum(not is_main(n) for n in state['index'])})
 
 
 @app.get('/api/art/<path:name>')
@@ -484,14 +497,19 @@ def api_author_page(name: str):
 	rows   = con().execute('SELECT art, author FROM authors WHERE author = ? COLLATE NOCASE', (name,)).fetchall()
 	linked = con().execute('SELECT name FROM users WHERE name = ?', (name,)).fetchone()
 	stats  = rating_stats()
-	return jsonify({'author': rows[0]['author'] if rows else name, 'user': linked['name'] if linked else '', 'files': [entry_meta(r['art'], stats, {r['art']: r['author']}) for r in rows if r['art'] in state['index']]})
+	return jsonify({'author': rows[0]['author'] if rows else name, 'user': linked['name'] if linked else '', 'files': [entry_meta(r['art'], stats, {r['art']: r['author']}) for r in rows if r['art'] in state['index'] and is_main(r['art'])]})
 
 
 @app.get('/api/authors')
 def api_authors():
-	'''Every author name with its art count.'''
+	'''Every author of gallery art (uploads waiting to be promoted don't count) with art count & a few random pieces for previews.'''
 
-	return jsonify([{'author': r['author'], 'count': r['n']} for r in con().execute('SELECT author, COUNT(*) n FROM authors GROUP BY author COLLATE NOCASE ORDER BY author COLLATE NOCASE')])
+	arts, names = {}, {}
+	for r in con().execute('SELECT art, author FROM authors'):
+		if r['art'] in state['index'] and is_main(r['art']):
+			arts.setdefault(r['author'].lower(), []).append(r['art'])
+			names.setdefault(r['author'].lower(), r['author'])
+	return jsonify([{'author': names[k], 'count': len(arts[k]), 'samples': [{'name': n, 'cols': state['index'][n]['cols']} for n in random.sample(arts[k], min(5, len(arts[k])))]} for k in sorted(arts)])
 
 
 @app.post('/api/avatar')
@@ -545,7 +563,7 @@ def api_comment():
 		return jsonify({'error': 'not found'}), 404
 	if not 1 <= len(body) <= 1000:
 		return jsonify({'error': 'comments must be 1-1000 characters'}), 400
-	if error := check_captcha(data):
+	if not user['admin'] and (error := check_captcha(data)):
 		return jsonify({'error': error}), 400
 	if db.limited(con(), f'comment:{user["id"]}', 20, 3600):
 		return jsonify({'error': 'comment limit reached (20 per hour)'}), 429
@@ -679,20 +697,21 @@ def api_report():
 		return jsonify({'error': 'login required'}), 403
 	if data.get('art') not in state['index'] or data.get('reason') not in REASONS:
 		return jsonify({'error': 'bad report'}), 400
-	if error := check_captcha(data):
+	if not user['admin'] and (error := check_captcha(data)):
 		return jsonify({'error': error}), 400
-	if db.limited(con(), f'report:{user["id"]}', 30, 86400):
+	if not user['admin'] and db.limited(con(), f'report:{user["id"]}', 30, 86400):
 		return jsonify({'error': 'report limit reached (30 per day)'}), 429
 	con().execute('INSERT INTO reports (art, user_id, reason, note, created) VALUES (?, ?, ?, ?, ?)', (data['art'], user['id'], data['reason'], str(data.get('note', '')).strip()[:500], int(time.time())))
 	con().commit()
 	return jsonify({'ok': True})
 
 
-@app.get('/api/thumbs')
+@app.post('/api/thumbs')
 def api_thumbs():
 	'''Thumbnail HTML for a batch of art files.'''
 
-	return jsonify({n: state['index'][n]['thumb'] if n in state['index'] else '' for n in request.args.getlist('n')})
+	names = request.json.get('names', [])[:200]
+	return jsonify({n: state['index'][n]['thumb'] if n in state['index'] else '' for n in names if isinstance(n, str)})
 
 
 @app.post('/api/upload')
@@ -717,6 +736,11 @@ def api_upload():
 		return jsonify({'error': f'max {MAX_LINES:,} lines'}), 400
 	if not ''.join(c for c, _, _, _ in art.parse(text.replace('\n', ''))).strip() and '\x03' not in text:
 		return jsonify({'error': 'that file has nothing visible in it'}), 400
+	if not form.get('force'):
+		if db.limited(con(), f'upcheck:{user["id"]}', 60, 3600):
+			return jsonify({'error': 'too many upload attempts, try again later'}), 429
+		if found := art.matches(ART, dict(state['index']), text):
+			return jsonify({'error': 'this looks like art that is already on IRCart', 'matches': found}), 409
 	if error := check_captcha(form):
 		return jsonify({'error': error}), 400
 	if db.limited(con(), f'upload:{user["id"]}', 20, 86400):
@@ -729,6 +753,7 @@ def api_upload():
 	with open(path, 'w', encoding='utf-8') as out:
 		out.write(text + '\n')
 	con().execute('INSERT OR REPLACE INTO uploads (art, user_id, created) VALUES (?, ?, ?)', (art_name, user['id'], int(time.time())))
+	con().execute('INSERT OR REPLACE INTO authors (art, author) VALUES (?, ?)', (art_name, user['name']))
 	con().commit()
 	file_changed(added=art_name)
 	return jsonify({'ok': True, 'art': art_name})
@@ -760,7 +785,7 @@ def api_user(name: str):
 		return jsonify({'error': 'no such user'}), 404
 	stats    = rating_stats()
 	uploads  = [r['art'] for r in con().execute('SELECT art FROM uploads WHERE user_id = ? ORDER BY created DESC', (user['id'],)) if r['art'] in state['index']]
-	authored = [r['art'] for r in con().execute('SELECT art FROM authors WHERE author = ? COLLATE NOCASE', (user['name'],)) if r['art'] in state['index']]
+	authored = [r['art'] for r in con().execute('SELECT art FROM authors WHERE author = ? COLLATE NOCASE', (user['name'],)) if r['art'] in state['index'] and is_main(r['art'])]
 	comments = [dict(r) for r in con().execute('SELECT art, body, created FROM comments WHERE user_id = ? ORDER BY created DESC LIMIT 30', (user['id'],))]
 	counts   = {k: con().execute(f'SELECT COUNT(*) FROM {t} WHERE user_id = ?', (user['id'],)).fetchone()[0] for k, t in (('comments', 'comments'), ('ratings', 'ratings'))}
 	return jsonify({'user': user_json(user), 'uploads': [entry_meta(n, stats) for n in uploads], 'authored': [entry_meta(n, stats) for n in authored], 'comments': comments, 'counts': counts})
@@ -798,11 +823,11 @@ def robots():
 def sitemap():
 	'''Every public page for search engines.'''
 
-	urls = [(f'{SITE}{p}', None) for p in ('/', '/uploads', '/authors', '/recent', '/about')]
+	urls = [(f'{SITE}{p}', None) for p in ('/', '/uploads', '/artists', '/recent', '/about')]
 	dirs = sorted({e['dir'] for n, e in state['index'].items() if is_main(n)})
 	urls += [(f'{SITE}/dir/{quote(d)}', None) for d in dirs]
 	urls += [(f'{SITE}/art/{quote(n)}', time.strftime('%Y-%m-%d', time.gmtime(e['mtime']))) for n, e in sorted(state['index'].items())]
-	urls += [(f'{SITE}/author/{quote(r["author"])}', None) for r in con().execute('SELECT DISTINCT author FROM authors')]
+	urls += [(f'{SITE}/artist/{quote(a)}', None) for a in sorted({r['author'] for r in con().execute('SELECT art, author FROM authors') if r['art'] in state['index'] and is_main(r['art'])})]
 	urls += [(f'{SITE}/user/{quote(r["name"])}', None) for r in con().execute('SELECT name FROM users')]
 	body = ''.join(f'<url><loc>{escape(u)}</loc>{f"<lastmod>{m}</lastmod>" if m else ""}</url>' for u, m in urls)
 	return Response(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{body}</urlset>', mimetype='application/xml')
@@ -813,6 +838,20 @@ def dirs_page():
 	'''The directory list lives in the gallery's dir filter now.'''
 
 	return redirect('/', 301)
+
+
+@app.get('/authors')
+def authors_redirect():
+	'''Authors were renamed to artists.'''
+
+	return redirect('/artists', 301)
+
+
+@app.get('/author/<path:name>')
+def author_redirect(name: str):
+	'''Authors were renamed to artists.'''
+
+	return redirect('/artist/' + quote(name), 301)
 
 
 @app.get('/random')
@@ -844,6 +883,7 @@ def seo(page: str) -> dict:
 	desc  = 'IRCart is the central hub for IRC formatted ASCII & ANSI art: browse, rate & copy thousands of mIRC color art pieces as IRC, ANSI or HTML.'
 	ctx   = {'title': 'IRCart - IRC ASCII & ANSI art archive', 'description': desc, 'canonical': f'{SITE}/{quote(page)}', 'robots': 'index, follow', 'jsonld': '', 'body': ''}
 	main  = [n for n in state['index'] if is_main(n)]
+	main_set = set(main)
 	dirs  = sorted({state['index'][n]['dir'] for n in main})
 	parts = page.split('/', 1)
 	if page == '':
@@ -871,11 +911,11 @@ def seo(page: str) -> dict:
 	elif page == 'uploads':
 		ups = sorted(n for n in state['index'] if not is_main(n))
 		ctx.update(title='Uploads - IRCart', description='IRC art uploaded by the IRCart community.', body='<h1>Uploads</h1><ul>' + ''.join(link(n) for n in ups) + '</ul>')
-	elif page == 'authors':
-		rows = con().execute('SELECT DISTINCT author FROM authors ORDER BY author COLLATE NOCASE').fetchall()
-		ctx.update(title='Authors - IRCart', description='Artists credited on IRCart.', body='<h1>Authors</h1><ul>' + ''.join(f'<li><a href="/author/{quote(r["author"])}">{escape(r["author"])}</a></li>' for r in rows) + '</ul>')
-	elif parts[0] == 'author' and len(parts) == 2:
-		rows = [r['art'] for r in con().execute('SELECT art FROM authors WHERE author = ? COLLATE NOCASE', (parts[1],)) if r['art'] in state['index']]
+	elif page == 'artists':
+		rows = sorted({r['author'] for r in con().execute('SELECT art, author FROM authors') if r['art'] in main_set}, key=str.lower)
+		ctx.update(title='Artists - IRCart', description='Artists credited on IRCart.', body='<h1>Artists</h1><ul>' + ''.join(f'<li><a href="/artist/{quote(a)}">{escape(a)}</a></li>' for a in rows) + '</ul>')
+	elif parts[0] == 'artist' and len(parts) == 2:
+		rows = [r['art'] for r in con().execute('SELECT art FROM authors WHERE author = ? COLLATE NOCASE', (parts[1],)) if r['art'] in main_set]
 		ctx.update(title=f'{parts[1]} - IRC art by {parts[1]} - IRCart', description=f'{len(rows)} IRC ASCII art pieces by {parts[1]} on IRCart.', body=f'<h1>{escape(parts[1])}</h1><ul>' + ''.join(link(n) for n in rows) + '</ul>')
 	elif parts[0] == 'user' and len(parts) == 2:
 		ctx.update(title=f'{parts[1]} - IRCart profile', description=f'{parts[1]} on IRCart: uploads, credited art & comments.', body=f'<h1>{escape(parts[1])}</h1>')
