@@ -304,7 +304,8 @@ async function galleryPage(scope, preset = {}) {
 	const rnd = new Map(files.map((f) => [f.name, Math.random()]));
 	const apply = () => {
 		const q = $('#q').value.toLowerCase(), dir = preset.dir !== undefined ? preset.dir : ($('#dir') ? $('#dir').value : '*'), sort = $('#sort').value;
-		const list = files.filter((f) => (dir === '*' || f.dir === dir) && (f.name.toLowerCase().includes(q) || (f.author || '').toLowerCase().includes(q)));
+		const hideNazi = dir === '*' && sort === 'random' && !q; // the randomized home page never shows nazi/, searching still finds it
+		const list = files.filter((f) => (dir === '*' || f.dir === dir) && !(hideNazi && f.dir === 'nazi') && (f.name.toLowerCase().includes(q) || (f.author || '').toLowerCase().includes(q)));
 		const num = {mtime: 1, lines: 1, cols: 1, size: 1}[sort];
 		list.sort((a, b) => sort === 'random' ? rnd.get(a.name) - rnd.get(b.name) : sort === 'top' ? (b.avg - a.avg) || (b.votes - a.votes) : num ? b[sort] - a[sort] : a.name.localeCompare(b.name));
 		if (rev && sort !== 'random') list.reverse();
